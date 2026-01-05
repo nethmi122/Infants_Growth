@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-tensorflow
+tensorflow-cpu
 shap
 scikit-learn
 pandas
 joblib
 numpy
+
