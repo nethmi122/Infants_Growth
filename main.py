@@ -1,20 +1,20 @@
+import os
+import joblib
+import numpy as np
+import tensorflow as tf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-import joblib
-import shap
 from typing import List
+import shap
 
-app = FastAPI()
+app = FastAPI(title="Baby Growth Prediction API")
 
-# 1. LOAD ASSETS
-model = tf.keras.models.load_model('baby_model.h5')
+# 1. LOAD ASSETS WITH COMPATIBILITY FIX
+# 'compile=False' prevents the mae-deserialization error on Render
+model = tf.keras.models.load_model('baby_model.h5', compile=False)
 scaler_X = joblib.load('scaler_X.pkl')
 scaler_y = joblib.load('scaler_y.pkl')
 
-# Define features exactly as per your training
 input_features = [
     'Kcal_Burned_Asleep', 'Kcal_Burned_Awake', 'Sleep_Hours', 'Awake_Hours',
     'F-Breast/Formula', 'F-Solid Meal', 'F-Nutritious Snacks',
@@ -23,19 +23,14 @@ input_features = [
     'Starting Height (cm)', 'Starting Weight (kg)'
 ]
 
-# 2. INITIALIZE SHAP
-# Note: In production, you'd ideally use a pre-calculated background set
-# For now, we assume a background slice was saved or passed
-explainer = None 
-
-def initialize_explainer(background_data):
-    global explainer
-    explainer = shap.DeepExplainer(model, background_data)
-
-# 3. DATA MODELS FOR API
+# 2. DATA MODELS FOR API
 class DailyLog(BaseModel):
-    # This matches the input_features list
-    logs: List[List[float]] # Expected shape: 7 days x 15 features
+    # Logs must be a list of 7 days, each day having 15 float values
+    logs: List[List[float]] 
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "model": "LSTM-V3-Medical"}
 
 @app.post("/predict")
 async def predict_growth(data: DailyLog):
@@ -43,15 +38,18 @@ async def predict_growth(data: DailyLog):
         # Convert input to numpy array
         current_window = np.array(data.logs) # Shape (7, 15)
         
+        if current_window.shape != (7, 15):
+            raise ValueError(f"Expected shape (7, 15), got {current_window.shape}")
+
         forecast_results = {}
         temp_window = current_window.copy()
         
-        # Recursive Loop for 7 Days
-        accumulated_weight_gain = 0
-        accumulated_height_gain = 0
+        # Recursive Loop for 7-Day Forecast
+        acc_weight = 0
+        acc_height = 0
         
         for day in range(1, 8):
-            # Scale and Reshape for LSTM (1, 7, 15)
+            # Scale and Reshape for LSTM (Batch, Timesteps, Features)
             scaled_input = scaler_X.transform(temp_window)
             scaled_input = scaled_input.reshape(1, 7, 15)
             
@@ -59,43 +57,40 @@ async def predict_growth(data: DailyLog):
             pred_scaled = model.predict(scaled_input, verbose=0)
             pred_real = scaler_y.inverse_transform(pred_scaled)
             
-            w_gain = float(pred_real[0][0])
-            h_gain = float(pred_real[0][1])
+            w_gain = float(pred_real[0][0]) # in grams (per our update)
+            h_gain = float(pred_real[0][1]) # in cm
             
-            accumulated_weight_gain += w_gain
-            accumulated_height_gain += h_gain
+            acc_weight += w_gain
+            acc_height += h_gain
             
-            if day == 1:
-                forecast_results["day_1"] = {"weight": w_gain, "height": h_gain}
-            if day == 3:
-                forecast_results["day_3"] = {"weight": accumulated_weight_gain, "height": accumulated_height_gain}
-            if day == 7:
-                forecast_results["day_7"] = {"weight": accumulated_weight_gain, "height": accumulated_height_gain}
+            # Capture specific milestones
+            if day in [1, 3, 7]:
+                forecast_results[f"day_{day}"] = {
+                    "weight_gain_g": round(acc_weight, 2),
+                    "height_gain_cm": round(acc_height, 3)
+                }
             
-            # SLIDE WINDOW: Update the features for the next recursive step
-            # We update the 'Starting Weight' and 'Height' in the new row
+            # UPDATE WINDOW FOR RECURSION
+            # 1. Slide window up
             new_row = temp_window[-1].copy()
-            new_row[-1] += (w_gain / 1000) # Weight (kg)
-            new_row[-2] += h_gain         # Height (cm)
-            new_row[10] += 1              # Increment Age in Days
+            # 2. Update weight/height/age for the 'simulated' next day
+            new_row[14] += (w_gain / 1000) # Starting Weight (kg) - Index 14
+            new_row[13] += h_gain           # Starting Height (cm) - Index 13
+            new_row[10] += 1                # Age in Days - Index 10
             
             temp_window = np.vstack([temp_window[1:], new_row])
 
-        # 4. SHAP EXPLANATION (For the most recent day)
-        if explainer:
-            scaled_explainer_input = scaler_X.transform(current_window).reshape(1, 7, 15)
-            shap_vals = explainer.shap_values(scaled_explainer_input)
-            # Impact of last day on weight gain
-            last_day_impact = shap_vals[0][0, -1, :] 
-            impact_dict = dict(zip(input_features, last_day_impact.tolist()))
-            top_reason = sorted(impact_dict.items(), key=lambda x: x[1], reverse=True)[0]
-            forecast_results["explanation"] = f"Top growth driver: {top_reason[0]}"
-
-        return forecast_results
+        return {
+            "prediction": forecast_results,
+            "unit_weight": "grams",
+            "unit_height": "cm"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Render uses the PORT environment variable
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
