@@ -1,7 +1,8 @@
-tensorflow
 fastapi
 uvicorn
+tensorflow
 shap
-pandas
 scikit-learn
+pandas
 joblib
+numpy
